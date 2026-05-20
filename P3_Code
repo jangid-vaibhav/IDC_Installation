@@ -1,0 +1,715 @@
+#include <Arduino.h>
+#include <ESPmDNS.h>
+#include <SPIFFS.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <Wire.h>
+
+const char *ssid = "Laptop VJ";
+const char *password = "123456789";
+
+#define CMD_RUN_SEQUENCE 0x01
+#define CMD_STOP 0x02
+#define CMD_GET_TOUCH 0x03
+#define CMD_SERVO2_RESET 0x04
+
+#define RESP_BUSY 0xAA
+#define RESP_STARTED 0xBB
+#define RESP_TOUCH_INACTIVE 0x00
+#define RESP_TOUCHED 0x01
+#define RESP_NOT_TOUCHED 0x02
+
+WebServer server(80);
+
+byte sendCommand(uint8_t address, byte cmd) {
+  Wire.beginTransmission(address);
+  Wire.write(cmd);
+  Wire.endTransmission();
+  delay(100);
+  Wire.requestFrom((uint8_t)address, (uint8_t)1);
+  if (Wire.available())
+    return Wire.read();
+  return 0xFF;
+}
+
+void handleSequence() {
+  String moduleStr = server.arg("module");
+  String prevStr = server.arg("prev"); // previous module address to reset
+
+  uint8_t address = (uint8_t)moduleStr.toInt();
+  uint8_t prevAddr = (uint8_t)prevStr.toInt();
+
+  // Reset servo2 on previous module if different
+  if (prevAddr != 0 && prevAddr != address) {
+    sendCommand(prevAddr, CMD_SERVO2_RESET);
+  }
+
+  byte resp = sendCommand(address, CMD_RUN_SEQUENCE);
+
+  if (resp == RESP_BUSY)
+    server.send(200, "text/plain", "BUSY");
+  else if (resp == RESP_STARTED)
+    server.send(200, "text/plain", "STARTED");
+  else
+    server.send(200, "text/plain", "ERROR");
+}
+
+void handleReset() {
+  String moduleStr = server.arg("module");
+  uint8_t address = (uint8_t)moduleStr.toInt();
+  sendCommand(address, CMD_SERVO2_RESET);
+  server.send(200, "text/plain", "RESET");
+}
+
+void handleTouch() {
+  String moduleStr = server.arg("module");
+  uint8_t address = (uint8_t)moduleStr.toInt();
+
+  byte resp = sendCommand(address, CMD_GET_TOUCH);
+
+  if (resp == RESP_TOUCH_INACTIVE)
+    server.send(200, "text/plain", "inactive");
+  else if (resp == RESP_TOUCHED)
+    server.send(200, "text/plain", "touched");
+  else if (resp == RESP_NOT_TOUCHED)
+    server.send(200, "text/plain", "nottouched");
+  else
+    server.send(200, "text/plain", "inactive");
+}
+
+const char *htmlPage = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Alumni Circles - IDC IITB</title>
+  
+  <!-- Import Poppins Font -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['Poppins', 'sans-serif'],
+          }
+        }
+      }
+    }
+  </script>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-[#ebebea] overflow-hidden">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+    // --- ICON COMPONENTS ---
+    const XIcon = ({ size = 20 }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+    );
+    const WifiIcon = ({ size = 14 }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12.55a11 11 0 0 1 14.08 0"></path><path d="M1.42 9a16 16 0 0 1 21.16 0"></path><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line></svg>
+    );
+    const WifiOffIcon = ({ size = 14 }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="2" y1="2" x2="22" y2="22"></line><path d="M8.53 16.11a6 6 0 0 1 6.95 0"></path><line x1="12" y1="20" x2="12.01" y2="20"></line><path d="M5 12.55a11 11 0 0 1 14.08 0"></path><path d="M1.42 9a16 16 0 0 1 21.16 0"></path></svg>
+    );
+
+    // --- DATA & CONFIG ---
+    // GitHub repository raw URL for hosting images
+    const GITHUB_MEDIA_URL = "https://raw.githubusercontent.com/jangid-vaibhav/IDC_Installation/main"; 
+
+    const getMediaUrl = (filename) => {
+      // If no GitHub URL is provided yet, fallback to local SPIFFS so the UI doesn't break immediately
+      return GITHUB_MEDIA_URL ? `${GITHUB_MEDIA_URL}${filename}` : filename;
+    };
+    const DISCIPLINES = [
+      { name: "B.Des", fullName: "Bachelor of Design", moduleId: 1, color: "#F28C28", image: "B.Des.png" },
+      { name: "ID", fullName: "Industrial Design", moduleId: 2, color: "#3E5C76", image: "Industrial%20Design.png" },
+      { name: "CD", fullName: "Communication Design", moduleId: 3, color: "#E45757", image: "Communication%20Design.png" },
+      { name: "AN", fullName: "Animation Design", moduleId: 4, color: "#079CB5", image: "Animation%20Design.png" },
+      { name: "IxD", fullName: "Interaction Design", moduleId: 5, color: "#905AD2", image: "Interaction%20Design.png" },
+      { name: "MVD", fullName: "Mobility and Vehicle Design", moduleId: 6, color: "#2AA83D", image: "Mobility%20and%20Vehicle%20Design.png" },
+      { name: "MRes", fullName: "MDes by Research", moduleId: 7, color: "#2A3F93", image: "M.Des%20by%20Research.png" },
+      { name: "PhD", fullName: "PhD in Design", moduleId: 8, color: "#6D213C", image: "PhD%20in%20Design.png" }
+    ];
+    
+    // Generate years from 1969 to 2026
+    const YEARS = Array.from({length: 2026 - 1969 + 1}, (_, i) => 1969 + i);
+
+    // Actual 2025 B.Des Data
+    const batch2025BDes = [
+      "Abhishek Bhalchandra Kshirsagar", "Adithya Krishna B S", "Aditi Chintey", "Ahmad Thaha Hussain",
+      "Akash Das", "Anniket Mohalik", "Anoof Pk", "Anshika Gangwar", "Anuj Sunil Ambhore", "Arijeet Nandy",
+      "Atharva Anil Vankundre", "Avani Prashant Bhagdikar", "Bharat Banslaa", "Dataram Meena",
+      "Dhairyasheel Sanjay Pawar", "Divyansh Rastogi", "H.Longkun Chaiwang Yanlem", "Harinarayan Krishnan",
+      "Harshal Prasad", "Jishnu Diwakar", "Laksh Jagdish Rajpal", "Madhumithan R", "Manish Verma",
+      "Manu Krishnan K", "Mehul Suresh Chaudhari", "Mukul Naresh Mahajan", "Raghav Samodia",
+      "Riddhi Sanjay Gadodia", "S Nithishwar", "Samarth Dhanuka", "Satvik Shrivastava",
+      "Tarun Sathiyamoorthy", "Tilak Anand", "Uday Somani", "Ujjwal Verma", "Vaibhav Jangid", "Yash Sanjay Kothari"
+    ];
+
+    const firstNames = ["Aarav", "Priya", "Rohan", "Ananya", "Ishaan", "Meera", "Vikram", "Neha", "Aditya", "Kavya"];
+    const lastNames = ["Patel", "Sharma", "Singh", "Deshmukh", "Iyer", "Rao", "Joshi", "Menon", "Reddy", "Verma"];
+    const companies = ["Google", "Studio M", "IDEO", "Microsoft", "TCS", "Fractal", "Zomato", "Flipkart", "Freelance"];
+
+    const getRandomName = () => `${firstNames[Math.floor(Math.random() * firstNames.length)]} ${lastNames[Math.floor(Math.random() * lastNames.length)]}`;
+    const getRandomCompany = () => companies[Math.floor(Math.random() * companies.length)];
+    const getRandomRole = (disc) => {
+      if (disc === "Interaction Design" || disc === "Communication Design" || disc === "IxD" || disc === "CD") return "UX Designer";
+      if (disc === "Animation Design" || disc === "B.Des" || disc === "AN") return "Creative Lead";
+      if (disc === "Industrial Design" || disc === "Mobility and Vehicle Design" || disc === "ID" || disc === "MVD") return "Industrial Designer";
+      if (disc === "MDes by Research" || disc === "PhD" || disc === "MRes") return "Design Researcher";
+      return "Design Consultant";
+    }
+
+    const MOCK_ALUMNI = [];
+    let idCounter = 1;
+    YEARS.forEach(year => {
+      DISCIPLINES.forEach(disc => {
+        if (year === 2025 && disc.fullName === "Bachelor of Design") {
+          batch2025BDes.forEach(name => {
+            MOCK_ALUMNI.push({
+              id: idCounter++,
+              name: name,
+              year,
+              discipline: disc.fullName,
+              moduleId: disc.moduleId,
+              avatar: `https://api.dicebear.com/7.x/notionists/svg?seed=${name.replace(/ /g, '')}&backgroundColor=f0f0f0`,
+              cardImage: name === "Vaibhav Jangid" ? getMediaUrl("/vaibhav.jpg") : undefined,
+              company: getRandomCompany(),
+              role: getRandomRole(disc.fullName),
+              bio: `Passionate about the intersection of technology, humanity, and ${disc.fullName.toLowerCase()}. Constantly exploring new horizons and pushing the boundaries of what is possible in the industry.`
+            });
+          });
+        } else {
+          const count = Math.floor(Math.random() * 5) + 1;
+          for (let i = 0; i < count; i++) {
+            const name = getRandomName();
+            MOCK_ALUMNI.push({
+              id: idCounter++,
+              name,
+              year,
+              discipline: disc.fullName,
+              moduleId: disc.moduleId,
+              avatar: `https://api.dicebear.com/7.x/notionists/svg?seed=${name.replace(' ', '')}&backgroundColor=f0f0f0`,
+              company: getRandomCompany(),
+              role: getRandomRole(disc.fullName),
+              bio: `Passionate about the intersection of technology, humanity, and ${disc.fullName.toLowerCase()}. Constantly exploring new horizons and pushing the boundaries of what is possible in the industry.`
+            });
+          }
+        }
+      });
+    });
+
+    const ESP_BASE_URL = ""; 
+
+    // --- SVG ARC HELPER ---
+    const describeArc = (x, y, innerRadius, outerRadius, startAngle, endAngle) => {
+      const polarToCartesian = (centerX, centerY, radius, angleInDegrees) => {
+        const angleInRadians = (angleInDegrees - 90) * Math.PI / 180.0;
+        return {
+          x: centerX + (radius * Math.cos(angleInRadians)),
+          y: centerY + (radius * Math.sin(angleInRadians))
+        };
+      };
+      const startOuter = polarToCartesian(x, y, outerRadius, endAngle);
+      const endOuter = polarToCartesian(x, y, outerRadius, startAngle);
+      const startInner = polarToCartesian(x, y, innerRadius, endAngle);
+      const endInner = polarToCartesian(x, y, innerRadius, startAngle);
+      const largeArcFlag = endAngle - startAngle <= 180 ? "0" : "1";
+      return [
+        "M", startOuter.x, startOuter.y,
+        "A", outerRadius, outerRadius, 0, largeArcFlag, 0, endOuter.x, endOuter.y,
+        "L", endInner.x, endInner.y,
+        "A", innerRadius, innerRadius, 0, largeArcFlag, 1, startInner.x, startInner.y,
+        "Z"
+      ].join(" ");
+    };
+
+    // --- MAIN APPLICATION ---
+    const App = () => {
+      const midYearIndex = (YEARS.length - 1) / 2;
+      const midDiscIndex = (DISCIPLINES.length - 1) / 2;
+
+      // Start with Default Selection
+      const defaultYearIndex = YEARS.indexOf(2025);
+      const defaultDiscIndex = 0;
+
+      const [yearRotation, setYearRotation] = useState(-(defaultYearIndex - midYearIndex) * 15);
+      const [discRotation, setDiscRotation] = useState(-(defaultDiscIndex - midDiscIndex) * 30);
+      const [alumniRotation, setAlumniRotation] = useState(0);
+      
+      const [isDraggingYear, setIsDraggingYear] = useState(false);
+      const [isDraggingDisc, setIsDraggingDisc] = useState(false);
+      const [isDraggingAlumni, setIsDraggingAlumni] = useState(false);
+
+      const yearDragRef = useRef({ startX: 0, startRot: 0 });
+      const discDragRef = useRef({ startX: 0, startRot: 0 });
+      const alumniDragRef = useRef({ startX: 0, startRot: 0, dragDistance: 0 });
+      
+      const lastFiredYearRef = useRef(defaultYearIndex);
+      const lastFiredDiscRef = useRef(defaultDiscIndex);
+
+      // Hardware State
+      const [pendingAlumni, setPendingAlumni] = useState(null);
+      const [selectedAlumni, setSelectedAlumni] = useState(null);
+      const activeModuleRef = useRef(0);
+
+      const activeYearIndex = Math.max(0, Math.min(YEARS.length - 1, Math.round((yearRotation / -15) + midYearIndex)));
+      const activeDiscIndex = Math.max(0, Math.min(DISCIPLINES.length - 1, Math.round((discRotation / -30) + midDiscIndex)));
+
+      const currentDiscipline = DISCIPLINES[activeDiscIndex];
+      const displayAlumni = MOCK_ALUMNI.filter(
+        (a) => a.year === YEARS[activeYearIndex] && a.discipline === currentDiscipline.fullName
+      );
+
+      const centeredAlumniIndex = Math.max(0, Math.min(displayAlumni.length - 1, Math.round(alumniRotation / 15)));
+      const centeredAlumni = displayAlumni[centeredAlumniIndex];
+
+      useEffect(() => {
+        setAlumniRotation(0);
+        resetHardware();
+      }, [activeYearIndex, activeDiscIndex]);
+
+      const getOpacityClass = (distance) => {
+        if (distance === 0) return 'opacity-100 font-bold scale-110 text-black';
+        if (distance === 1) return 'opacity-70 text-gray-500 scale-95';
+        if (distance <= 3) return 'opacity-30 text-gray-400 scale-90';
+        if (distance <= 5) return 'opacity-10 text-gray-300 scale-75';
+        return 'opacity-0 pointer-events-none'; 
+      };
+
+      // --- DRAG HANDLERS (Horizontal axis for bottom-center arc) ---
+      const handleYearPointerDown = (e) => {
+        yearDragRef.current = { startX: e.clientX, startRot: yearRotation };
+        setIsDraggingYear(true);
+        e.target.setPointerCapture(e.pointerId);
+      };
+      const handleYearPointerMove = (e) => {
+        if (!isDraggingYear) return;
+        const deltaX = e.clientX - yearDragRef.current.startX;
+        let newRot = yearDragRef.current.startRot + deltaX * 0.3;
+        newRot = Math.max(-(YEARS.length - 1 - midYearIndex) * 15 - 15, Math.min(midYearIndex * 15 + 15, newRot)); 
+        setYearRotation(newRot);
+      };
+      const handleYearPointerUp = (e) => {
+        if (!isDraggingYear) return;
+        setIsDraggingYear(false);
+        e.target.releasePointerCapture(e.pointerId);
+        setYearRotation(-(activeYearIndex - midYearIndex) * 15);
+        if (activeYearIndex !== lastFiredYearRef.current) {
+          lastFiredYearRef.current = activeYearIndex;
+          resetHardware();
+        }
+      };
+
+      const handleDiscPointerDown = (e) => {
+        discDragRef.current = { startX: e.clientX, startRot: discRotation };
+        setIsDraggingDisc(true);
+        e.target.setPointerCapture(e.pointerId);
+      };
+      const handleDiscPointerMove = (e) => {
+        if (!isDraggingDisc) return;
+        const deltaX = e.clientX - discDragRef.current.startX;
+        let newRot = discDragRef.current.startRot + deltaX * 0.3;
+        newRot = Math.max(-(DISCIPLINES.length - 1 - midDiscIndex) * 30 - 30, Math.min(midDiscIndex * 30 + 30, newRot));
+        setDiscRotation(newRot);
+      };
+      const handleDiscPointerUp = (e) => {
+        if (!isDraggingDisc) return;
+        setIsDraggingDisc(false);
+        e.target.releasePointerCapture(e.pointerId);
+        setDiscRotation(-(activeDiscIndex - midDiscIndex) * 30);
+        if (activeDiscIndex !== lastFiredDiscRef.current) {
+          lastFiredDiscRef.current = activeDiscIndex;
+          resetHardware();
+        }
+      };
+
+      const handleAlumniPointerDown = (e) => {
+        alumniDragRef.current = { startX: e.clientX, startRot: alumniRotation, dragDistance: 0 };
+        setIsDraggingAlumni(true);
+        e.target.setPointerCapture(e.pointerId);
+      };
+      const handleAlumniPointerMove = (e) => {
+        if (!isDraggingAlumni) return;
+        const deltaX = e.clientX - alumniDragRef.current.startX;
+        alumniDragRef.current.dragDistance = deltaX;
+        if (Math.abs(deltaX) > 5 && (pendingAlumni || selectedAlumni)) {
+          resetHardware();
+        }
+        let newRot = alumniDragRef.current.startRot + deltaX * 0.3;
+        const maxRot = Math.max(0, (displayAlumni.length - 1) * 15);
+        newRot = Math.max(-15, Math.min(maxRot + 15, newRot));
+        setAlumniRotation(newRot);
+      };
+      const handleAlumniPointerUp = (e) => {
+        if (!isDraggingAlumni) return;
+        setIsDraggingAlumni(false);
+        e.target.releasePointerCapture(e.pointerId);
+        const snappedRot = Math.max(0, Math.min((displayAlumni.length - 1) * 15, Math.round(alumniRotation / 15) * 15));
+        setAlumniRotation(snappedRot);
+      };
+
+      const resetHardware = async () => {
+        if (activeModuleRef.current) {
+          try { await fetch(`${ESP_BASE_URL}/reset?module=${activeModuleRef.current}`); } catch (e) {}
+        }
+        setPendingAlumni(null);
+        setSelectedAlumni(null);
+        activeModuleRef.current = 0;
+      };
+
+      const handleAlumniSelect = async (alumni) => {
+        if (Math.abs(alumniDragRef.current.dragDistance) > 5) {
+          alumniDragRef.current.dragDistance = 0;
+          return;
+        }
+        const prevModule = activeModuleRef.current;
+        const newModule = alumni.moduleId;
+        setPendingAlumni(alumni);
+        setSelectedAlumni(null);
+        activeModuleRef.current = newModule;
+        try {
+          await fetch(`${ESP_BASE_URL}/sequence?module=${newModule}&prev=${prevModule}`);
+        } catch (e) {}
+      };
+
+      useEffect(() => {
+        const handleKeyDown = (e) => { if (e.key === 'Escape') resetHardware(); };
+        window.addEventListener('keydown', handleKeyDown);
+        return () => window.removeEventListener('keydown', handleKeyDown);
+      }, []);
+
+      const describeCirclePath = (r) => `M -${r} 0 A ${r} ${r} 0 0 1 ${r} 0`;
+
+      return (
+        <React.Fragment>
+          <style>{`
+            .ipad-bg { background-color: #f5f5f5; }
+          `}</style>
+
+          <div className="relative w-full h-screen ipad-bg overflow-hidden text-[#333] font-sans select-none">
+
+            {/* --- TOUCH ZONES (horizontal bands from bottom) --- */}
+            <div 
+              className={`absolute bottom-0 left-0 w-full h-[33vh] z-30 touch-none ${isDraggingDisc ? 'cursor-grabbing' : 'cursor-grab'}`}
+              onPointerDown={handleDiscPointerDown}
+              onPointerMove={handleDiscPointerMove}
+              onPointerUp={handleDiscPointerUp}
+              onPointerCancel={handleDiscPointerUp}
+            />
+            <div 
+              className={`absolute bottom-[33vh] left-0 w-full h-[22vh] z-30 touch-none ${isDraggingYear ? 'cursor-grabbing' : 'cursor-grab'}`}
+              onPointerDown={handleYearPointerDown}
+              onPointerMove={handleYearPointerMove}
+              onPointerUp={handleYearPointerUp}
+              onPointerCancel={handleYearPointerUp}
+            />
+            <div 
+              className={`absolute bottom-[55vh] left-0 w-full h-[45vh] z-40 touch-none ${isDraggingAlumni ? 'cursor-grabbing' : 'cursor-grab'}`}
+              onPointerDown={handleAlumniPointerDown}
+              onPointerMove={handleAlumniPointerMove}
+              onPointerUp={handleAlumniPointerUp}
+              onPointerCancel={handleAlumniPointerUp}
+            />
+
+            {/* --- MASTER UI SVG --- */}
+            <svg
+              viewBox="-2000 -2000 4000 4000"
+              className="absolute pointer-events-none z-10"
+              style={{ top: '135vh', left: '50%', width: '400vh', height: '400vh', transform: 'translate(-50%, -50%)', overflow: 'visible' }}
+            >
+              <defs>
+                <path id="discPath" d={describeCirclePath(641)} />
+                <path id="yearPath" d={describeCirclePath(825)} />
+              </defs>
+
+              {/* DISCIPLINE GRAPHICS - background images centered at dial origin */}
+              {DISCIPLINES.map((disc, i) => (
+                <image
+                  key={`bg-graphic-${i}`}
+                  href={getMediaUrl(`/${disc.image}`)}
+                  x="-600"
+                  y="-600"
+                  width="1200"
+                  height="1200"
+                  preserveAspectRatio="xMidYMid meet"
+                  opacity={i === activeDiscIndex ? 1 : 0}
+                  transform={`rotate(${discRotation})`}
+                  className={`pointer-events-none transition-all ${isDraggingDisc ? 'duration-0' : 'duration-[400ms] ease-out'}`}
+                />
+              ))}
+
+              {/* THIN LINE AND DOTS */}
+              <circle cx="0" cy="0" r="700" fill="none" stroke="#e0e0e0" strokeWidth="2" />
+              {DISCIPLINES.map((disc, i) => {
+                const itemAngle = (i - midDiscIndex) * 30 + discRotation;
+                if (Math.abs(itemAngle) > 90) return null;
+                const distance = Math.abs(i - activeDiscIndex);
+                const rad = itemAngle * Math.PI / 180;
+                const cx = 700 * Math.sin(rad);
+                const cy = -700 * Math.cos(rad);
+                return (
+                  <React.Fragment key={`dot-${i}`}>
+                    {distance === 0 && <circle cx={cx} cy={cy} r={22} fill="#f5f5f5" className={`transition-all ${isDraggingDisc ? 'duration-0' : 'duration-[400ms]'}`} />}
+                    <circle cx={cx} cy={cy} r={distance === 0 ? 10 : 7} fill={distance === 0 ? disc.color : "#e0e0e0"} className={`transition-all ${isDraggingDisc ? 'duration-0' : 'duration-[400ms]'}`} />
+                  </React.Fragment>
+                );
+              })}
+
+              {/* SCALE TICKS */}
+              {(() => {
+                const ticks = [];
+                YEARS.forEach((year, i) => {
+                  const yearAngle = (i - midYearIndex) * 15 + yearRotation;
+                  
+                  // Major tick for the year
+                  if (Math.abs(yearAngle) <= 95) {
+                    ticks.push({
+                      angle: yearAngle,
+                      isMajor: true,
+                      key: `tick-major-${i}`
+                    });
+                  }
+                  
+                  // Minor ticks between this year and next year (12 subdivisions for 12 months)
+                  if (i < YEARS.length - 1) {
+                    for (let k = 1; k < 12; k++) {
+                      const minorAngle = yearAngle + k * 1.25;
+                      if (Math.abs(minorAngle) <= 95) {
+                        ticks.push({
+                          angle: minorAngle,
+                          isMajor: false,
+                          key: `tick-minor-${i}-${k}`
+                        });
+                      }
+                    }
+                  }
+                });
+
+                return ticks.map(tick => {
+                  const rad = tick.angle * Math.PI / 180;
+                  
+                  // Start radius defaults to 735 (35px gap from the 700px discipline dial)
+                  let rInner = 735;
+                  
+                  // Dynamic clearance bubble around active dot (at 0 degrees, radius 700, active dot radius 10)
+                  const clearanceRadius = 45; // Ensures a perfectly uniform 35px clearance from the dot edge
+                  const sinVal = Math.sin(rad);
+                  const cosVal = Math.cos(rad);
+                  const term = clearanceRadius * clearanceRadius - 490000 * sinVal * sinVal;
+                  if (term >= 0) {
+                    const rClear = 700 * cosVal + Math.sqrt(term);
+                    if (rClear > rInner) {
+                      rInner = rClear;
+                    }
+                  }
+
+                  const isActive = tick.isMajor && tick.key === `tick-major-${activeYearIndex}`;
+                  
+                  // All ticks use the same outer radius for uniform length.
+                  const rOuter = 915;
+                  
+                  const x1 = rInner * sinVal;
+                  const y1 = -rInner * cosVal;
+                  const x2 = rOuter * sinVal;
+                  const y2 = -rOuter * cosVal;
+                  
+                  const strokeColor = isActive ? currentDiscipline.color : (tick.isMajor ? "#d8d8d8" : "#e8e8e8");
+                  const strokeW = isActive ? 3 : (tick.isMajor ? 2.5 : 1);
+                  const opacity = isActive ? 0.7 : Math.max(0, 1 - Math.abs(tick.angle) / 80);
+
+                  return (
+                    <line
+                      key={tick.key}
+                      x1={x1}
+                      y1={y1}
+                      x2={x2}
+                      y2={y2}
+                      stroke={strokeColor}
+                      strokeWidth={strokeW}
+                      opacity={opacity}
+                      className={`transition-all ${isDraggingYear ? 'duration-0' : 'duration-[400ms]'}`}
+                    />
+                  );
+                });
+              })()}
+
+              {/* DISCIPLINES TEXT */}
+              {DISCIPLINES.map((disc, i) => {
+                const itemAngle = (i - midDiscIndex) * 30 + discRotation;
+                if (Math.abs(itemAngle) > 90) return null;
+                const distance = Math.abs(i - activeDiscIndex);
+                const offset = 50 + (itemAngle / 90) * 50;
+                return (
+                  <text key={`disc-${i}`} fontSize={distance === 0 ? "26" : "22"} fontWeight={distance === 0 ? "bold" : "500"} fill={distance === 0 ? disc.color : "#666"} className={`transition-all ${isDraggingDisc ? 'duration-0' : 'duration-[400ms]'}`}>
+                    <textPath href="#discPath" startOffset={`${offset}%`} textAnchor="middle">
+                      {disc.fullName}
+                    </textPath>
+                  </text>
+                );
+              })}
+
+              {/* YEARS TEXT */}
+              {YEARS.map((year, i) => {
+                const itemAngle = (i - midYearIndex) * 15 + yearRotation;
+                if (Math.abs(itemAngle) > 90) return null;
+                const distance = Math.abs(i - activeYearIndex);
+                const offset = 50 + (itemAngle / 90) * 50;
+                return (
+                  <g key={`year-group-${i}`}>
+                    {/* Background Mask Box - positioned to center around where text renders (above baseline at r=825) */}
+                    {/* Active 26px: cap top ~y=-843, baseline y=-825, visual center ~y=-834. Mask centered at -834. */}
+                    {/* Inactive 22px: cap top ~y=-840, baseline y=-825, visual center ~y=-833. Mask centered at -833. */}
+                    <rect
+                      transform={`rotate(${itemAngle})`}
+                      x={distance === 0 ? -50 : -40}
+                      y={distance === 0 ? -852 : -848}
+                      width={distance === 0 ? 100 : 80}
+                      height={distance === 0 ? 36 : 31}
+                      rx="6"
+                      fill="#f5f5f5"
+                      className={`transition-all ${isDraggingYear ? 'duration-0' : 'duration-[400ms]'}`}
+                    />
+                    <text fontSize={distance === 0 ? "26" : "22"} fontWeight={distance === 0 ? "bold" : "500"} fill={distance === 0 ? currentDiscipline.color : "#666"} className={`transition-all ${isDraggingYear ? 'duration-0' : 'duration-[400ms]'}`}>
+                      <textPath href="#yearPath" startOffset={`${offset}%`} textAnchor="middle">
+                        {year}
+                      </textPath>
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* ALUMNI RING */}
+              <g className="transition-transform duration-[400ms] ease-out" style={{ transform: `rotate(${alumniRotation}deg)`, transition: isDraggingAlumni ? 'none' : '' }}>
+                {/* Hit area */}
+                <path d={describeArc(0, 0, 950, 1250, -90, 90)} fill="rgba(0,0,0,0)" style={{ pointerEvents: 'all' }} />
+
+                {displayAlumni.map((alumni, i) => {
+                  const angle = -i * 15;
+                  const currentAngle = angle + alumniRotation;
+                  if (Math.abs(currentAngle) > 90) return null;
+
+                  const isCenter = centeredAlumniIndex === i && !pendingAlumni && !selectedAlumni;
+                  
+                  const R_outer = isCenter ? 1250 : 1150;
+                  const path = describeArc(0, 0, 950, R_outer, -7.2, 7.2);
+
+                  const nameParts = alumni.name.split(' ');
+                  const firstLine = nameParts[0];
+                  const secondLine = nameParts.length > 2 ? nameParts[1] : nameParts.slice(1).join(' ');
+                  const thirdLine = nameParts.length > 2 ? nameParts.slice(2).join(' ') : null;
+
+                  return (
+                    <g key={alumni.id} transform={`rotate(${angle})`} className="cursor-pointer" onClick={() => handleAlumniSelect(alumni)} style={{ pointerEvents: 'auto' }}>
+                      <defs>
+                        <pattern id={`pat-${alumni.id}`} patternUnits="userSpaceOnUse" x="-200" y="-1300" width="400" height="400">
+                          <image href={alumni.avatar} width="400" height="400" preserveAspectRatio="xMidYMid slice" />
+                        </pattern>
+                      </defs>
+
+                      {/* Base path (white background) */}
+                      <path d={path} fill="#ffffff" className="transition-all duration-300 ease-out" />
+                      
+                      {/* Image pattern overlay */}
+                      <path 
+                        d={path} 
+                        fill={`url(#pat-${alumni.id})`} 
+                        stroke={isCenter ? "#ffffff" : "none"} 
+                        strokeWidth={isCenter ? 3 : 0} 
+                        className="transition-all duration-300 ease-out" 
+                      />
+                      
+                      {/* Grey tinted overlay - fades out when active */}
+                      <path 
+                        d={path} 
+                        fill="rgba(80,80,80,0.85)" 
+                        className="transition-all duration-300 ease-out" 
+                        style={{ opacity: isCenter ? 0 : 1, pointerEvents: 'none' }} 
+                      />
+
+                      {/* Curved-aligned text - fades out when active */}
+                      <text
+                        fill="white"
+                        fontSize="13"
+                        fontWeight="bold"
+                        textAnchor="middle"
+                        dominantBaseline="middle"
+                        className="pointer-events-none uppercase tracking-[0.1em] drop-shadow-md font-sans transition-opacity duration-300"
+                        style={{ opacity: isCenter ? 0 : 1 }}
+                      >
+                        {thirdLine ? (
+                          <React.Fragment>
+                            <tspan x="0" y="-1070">{firstLine}</tspan>
+                            <tspan x="0" y="-1050">{secondLine}</tspan>
+                            <tspan x="0" y="-1030">{thirdLine}</tspan>
+                          </React.Fragment>
+                        ) : secondLine ? (
+                          <React.Fragment>
+                            <tspan x="0" y="-1060">{firstLine}</tspan>
+                            <tspan x="0" y="-1040">{secondLine}</tspan>
+                          </React.Fragment>
+                        ) : (
+                          <tspan x="0" y="-1050">{firstLine}</tspan>
+                        )}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
+            </svg>
+          </div>
+        </React.Fragment>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
+)rawhtml";
+
+void handleRoot() { server.send(200, "text/html", htmlPage); }
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("An Error has occurred while mounting SPIFFS");
+  }
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin("esp32"))
+    Serial.println("Access at http://esp32.local");
+
+  server.on("/", handleRoot);
+  server.serveStatic("/vaibhav.jpg", SPIFFS, "/vaibhav.jpg");
+  server.serveStatic("/bdes.png", SPIFFS, "/bdes.png");
+  server.on("/sequence", handleSequence);
+  server.on("/touch", handleTouch);
+  server.on("/reset", handleReset);
+  server.begin();
+  Serial.println("Server started");
+}
+
+void loop() { server.handleClient(); }
